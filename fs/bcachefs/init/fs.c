@@ -1644,8 +1644,6 @@ static int __init bcachefs_init(void)
 	    bch2_debug_init())
 		goto err;
 
-	pr_info("bcachefs: custom swap code loaded\n");
-
 	return 0;
 err:
 	bcachefs_exit();

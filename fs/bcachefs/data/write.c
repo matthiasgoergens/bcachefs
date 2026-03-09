@@ -782,8 +782,8 @@ void bch2_write_point_do_index_updates(struct work_struct *work)
 				       elapsed / NSEC_PER_MSEC);
 				WARN_ON_ONCE(1);
 			}
-			if (unlikely(elapsed > 10ULL * NSEC_PER_SEC))
-				BUG();
+		if (unlikely(elapsed > 10ULL * NSEC_PER_SEC))
+			BUG_ON(IS_ENABLED(CONFIG_BCACHEFS_DEBUG));
 		}
 	}
 }
