@@ -514,6 +514,11 @@ static int __bch2_fs_read_write(struct bch_fs *c, bool early)
 		return bch_err_throw(c, erofs_filesystem_full);
 	}
 
+	if (c->sb.features & BIT_ULL(BCH_FEATURE_no_default_sb)) {
+		bch_err(c, "cannot go rw, run bcachefs migrate-superblock first");
+		return bch_err_throw(c, erofs_sb_not_migrated);
+	}
+
 	if (test_bit(BCH_FS_rw, &c->flags))
 		return 0;
 
@@ -914,7 +919,8 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 	if (c->opts.journal_rewind)
 		c->opts.fsck = true;
 
-	if (!(c->sb.features & BIT_ULL(BCH_FEATURE_small_image)) ||
+	if (!(c->sb.features & (BIT_ULL(BCH_FEATURE_small_image)|
+			        BIT_ULL(BCH_FEATURE_no_default_sb))) ||
 	    bch2_fs_will_resize_on_mount(c))
 		set_bit(BCH_FS_may_upgrade_downgrade, &c->flags);
 
@@ -1054,13 +1060,13 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 	if (BCH_SB_INITIALIZED(c->disk_sb.sb)) {
 		if (!(c->sb.features & BIT_ULL(BCH_FEATURE_new_extent_overwrite))) {
 			prt_str(out, "feature new_extent_overwrite not set, filesystem no longer supported\n");
-			return -EINVAL;
+			return bch_err_throw(c, EINVAL_missing_new_extent_overwrite);
 		}
 
 		if (c->sb.version_min < bcachefs_metadata_version_btree_ptr_sectors_written) {
 			prt_str(out, "version_min < version_btree_ptr_sectors_written\n");
 			prt_str(out, "filesystem needs upgrade from older version; run fsck from older bcachefs-tools to fix\n");
-			return -EINVAL;
+			return bch_err_throw(c, EINVAL_version_min_too_old);
 		}
 	}
 
@@ -1143,16 +1149,65 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
 		guard(mutex)(&c->sb_lock);
 		try(bch2_sb_to_fs(c, sb));
+
+		sb = c->disk_sb.sb;
+
+		/* Ensure sb_field_ext and members_v2 exist at current size
+		 * before reading opts, so ext opts see a fully-sized field: */
+		struct bch_sb_field_ext *ext =
+		    bch2_sb_field_get_minsize(&c->disk_sb, ext,
+				sizeof(struct bch_sb_field_ext) / sizeof(u64));
+		if (!ext)
+			return bch_err_throw(c, ENOSPC_sb);
+
+		sb = c->disk_sb.sb;
+
+		try(bch2_sb_members_v2_init(c));
+
+		/* Compat: */
+		if (!BCH_SB_JOURNAL_FLUSH_DELAY(sb))
+			SET_BCH_SB_JOURNAL_FLUSH_DELAY(sb, 1000);
+		if (!BCH_SB_JOURNAL_RECLAIM_DELAY(sb))
+			SET_BCH_SB_JOURNAL_RECLAIM_DELAY(sb, 1000);
+
+		if (!BCH_SB_VERSION_UPGRADE_COMPLETE(sb))
+			SET_BCH_SB_VERSION_UPGRADE_COMPLETE(sb, le16_to_cpu(sb->version));
+
+		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_disk_accounting_v2 &&
+		    !BCH_SB_ALLOCATOR_STUCK_TIMEOUT(sb))
+			SET_BCH_SB_ALLOCATOR_STUCK_TIMEOUT(sb, 30);
+
+		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_disk_accounting_v2)
+			SET_BCH_SB_PROMOTE_WHOLE_EXTENTS(sb, true);
+
+		if (!BCH_SB_WRITE_ERROR_TIMEOUT(sb))
+			SET_BCH_SB_WRITE_ERROR_TIMEOUT(sb, 30);
+
+		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_extent_flags &&
+		    !BCH_SB_CSUM_ERR_RETRY_NR(sb))
+			SET_BCH_SB_CSUM_ERR_RETRY_NR(sb, 3);
+
+		if (!BCH_SB_EXT_DEV_READAHEAD(ext))
+			SET_BCH_SB_EXT_DEV_READAHEAD(ext, SZ_2M >> 9);
+
+		if (!BCH_SB_EXT_EC_STRIPE_BUF_LIMIT(ext))
+			SET_BCH_SB_EXT_EC_STRIPE_BUF_LIMIT(ext, 5);
+
+		for (unsigned opt_id = 0; opt_id < bch2_opts_nr; opt_id++) {
+			const struct bch_option *opt = bch2_opt_table + opt_id;
+
+			if (opt->get_sb || opt->get_ext) {
+				u64 v = bch2_opt_from_sb(sb, opt_id, -1);
+
+				CLASS(printbuf, err)();
+				int ret = bch2_opt_validate(opt, v, &err);
+				if (ret) {
+					prt_printf(out, "Invalid superblock option %s", err.buf);
+					return ret;
+				}
+			}
+		}
 	}
-
-	/* Compat: */
-	if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_inode_v2 &&
-	    !BCH_SB_JOURNAL_FLUSH_DELAY(sb))
-		SET_BCH_SB_JOURNAL_FLUSH_DELAY(sb, 1000);
-
-	if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_inode_v2 &&
-	    !BCH_SB_JOURNAL_RECLAIM_DELAY(sb))
-		SET_BCH_SB_JOURNAL_RECLAIM_DELAY(sb, 100);
 
 	c->opts = bch2_opts_default;
 	try(bch2_opts_from_sb(&c->opts, sb));
@@ -1163,7 +1218,7 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
 	    c->opts.block_size > PAGE_SIZE) {
 		prt_printf(out, "cannot mount bs > ps filesystem without CONFIG_TRANSPARENT_HUGEPAGE\n");
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_block_size_needs_thp);
 	}
 #endif
 
@@ -1213,13 +1268,13 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 				   unicode_major(BCH_FS_DEFAULT_UTF8_ENCODING),
 				   unicode_minor(BCH_FS_DEFAULT_UTF8_ENCODING),
 				   unicode_rev(BCH_FS_DEFAULT_UTF8_ENCODING));
-			return -EINVAL;
+			return bch_err_throw(c, EINVAL_utf8_load_failed);
 		}
 	}
 #else
 	if (c->sb.features & BIT_ULL(BCH_FEATURE_casefolding)) {
 		prt_printf(out, "Cannot mount a filesystem with casefolding on a kernel without CONFIG_UNICODE\n");
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_casefolding_no_unicode);
 	}
 #endif
 
@@ -1235,15 +1290,6 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	bch2_journal_entry_res_resize(&c->journal,
 			&c->clock_journal_res,
 			(sizeof(struct jset_entry_clock) / sizeof(u64)) * 2);
-
-	scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
-		guard(mutex)(&c->sb_lock);
-		if (!bch2_sb_field_get_minsize(&c->disk_sb, ext,
-				sizeof(struct bch_sb_field_ext) / sizeof(u64)))
-			return bch_err_throw(c, ENOSPC_sb);
-
-		try(bch2_sb_members_v2_init(c));
-	}
 
 	scoped_guard(rwsem_write, &c->state_lock)
 		darray_for_each(*sbs, sb)
@@ -1297,7 +1343,7 @@ static int bch2_fs_may_start(struct bch_fs *c, struct printbuf *err)
 
 	if (c->opts.no_version_check) {
 		prt_printf(err, "Cannot start with opts.no_version_check\n");
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_no_version_check_start);
 	}
 
 	switch (c->opts.degraded) {

@@ -38,7 +38,7 @@ struct bch2_metadata_version {
 };
 
 static const struct bch2_metadata_version bch2_metadata_versions[] = {
-#define x(n, v) {		\
+#define x(n, v, ...) {		\
 	.version = v,				\
 	.name = #n,				\
 },
@@ -108,7 +108,7 @@ int bch2_set_version_incompat(struct bch_fs *c, enum bcachefs_metadata_version v
 }
 
 const char * const bch2_sb_fields[] = {
-#define x(name, nr)	#name,
+#define x(name, nr, ...)	#name,
 	BCH_SB_FIELDS()
 #undef x
 	NULL
@@ -390,8 +390,6 @@ static int bch2_sb_compatible(struct bch_sb *sb, struct printbuf *out)
 int bch2_sb_validate(struct bch_sb *sb, struct bch_opts *opts, u64 read_offset,
 		     enum bch_validate_flags flags, struct printbuf *out)
 {
-	enum bch_opt_id opt_id;
-
 	try(bch2_sb_compatible(sb, out));
 
 	if (!opts->no_version_check) {
@@ -475,52 +473,10 @@ int bch2_sb_validate(struct bch_sb *sb, struct bch_opts *opts, u64 read_offset,
 	if (sb->nr_devices > 1)
 		SET_BCH_SB_MULTI_DEVICE(sb, true);
 
-	if (!flags) {
-		/*
-		 * Been seeing a bug where these are getting inexplicably
-		 * zeroed, so we're now validating them, but we have to be
-		 * careful not to preven people's filesystems from mounting:
-		 */
-		if (!BCH_SB_JOURNAL_FLUSH_DELAY(sb))
-			SET_BCH_SB_JOURNAL_FLUSH_DELAY(sb, 1000);
-		if (!BCH_SB_JOURNAL_RECLAIM_DELAY(sb))
-			SET_BCH_SB_JOURNAL_RECLAIM_DELAY(sb, 1000);
-
-		if (!BCH_SB_VERSION_UPGRADE_COMPLETE(sb))
-			SET_BCH_SB_VERSION_UPGRADE_COMPLETE(sb, le16_to_cpu(sb->version));
-
-		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_disk_accounting_v2 &&
-		    !BCH_SB_ALLOCATOR_STUCK_TIMEOUT(sb))
-			SET_BCH_SB_ALLOCATOR_STUCK_TIMEOUT(sb, 30);
-
-		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_disk_accounting_v2)
-			SET_BCH_SB_PROMOTE_WHOLE_EXTENTS(sb, true);
-
-		if (!BCH_SB_WRITE_ERROR_TIMEOUT(sb))
-			SET_BCH_SB_WRITE_ERROR_TIMEOUT(sb, 30);
-
-		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_extent_flags &&
-		    !BCH_SB_CSUM_ERR_RETRY_NR(sb))
-			SET_BCH_SB_CSUM_ERR_RETRY_NR(sb, 3);
-	}
-
 #ifdef __KERNEL__
 	if (!BCH_SB_SHARD_INUMS_NBITS(sb))
 		SET_BCH_SB_SHARD_INUMS_NBITS(sb, ilog2(roundup_pow_of_two(num_online_cpus())));
 #endif
-
-	for (opt_id = 0; opt_id < bch2_opts_nr; opt_id++) {
-		const struct bch_option *opt = bch2_opt_table + opt_id;
-
-		if (opt->get_sb) {
-			u64 v = bch2_opt_from_sb(sb, opt_id, -1);
-
-			prt_printf(out, "Invalid option ");
-			try(bch2_opt_validate(opt, v, out));
-
-			printbuf_reset(out);
-		}
-	}
 
 	/* validate layout */
 	try(validate_sb_layout(&sb->layout, out));
@@ -1344,7 +1300,7 @@ static const struct bch_sb_field_ops bch_sb_field_ops_ext = {
 };
 
 static const struct bch_sb_field_ops *bch2_sb_field_ops[] = {
-#define x(f, nr)					\
+#define x(f, nr, ...)					\
 	[BCH_SB_FIELD_##f] = &bch_sb_field_ops_##f,
 	BCH_SB_FIELDS()
 #undef x
@@ -1528,7 +1484,7 @@ void bch2_sb_to_text(struct printbuf *out,
 		for (id = 0; id < bch2_opts_nr; id++) {
 			const struct bch_option *opt = bch2_opt_table + id;
 
-			if (opt->get_sb) {
+			if (opt->get_sb || opt->get_ext) {
 				u64 v = bch2_opt_from_sb(sb, id, -1);
 
 				prt_printf(out, "%s:\t", opt->attr.name);

@@ -32,8 +32,10 @@ struct alloc_request {
 	u8			ec_replicas;
 	unsigned		target;
 	bool			ec:1;
+	bool			new_stripe_alloc:1;
 	bool			will_retry_all_devices:1;
 	bool			will_retry_target_devices:1;
+	bool			will_retry_set_devices:1;
 	enum bch_watermark	watermark;
 	enum bch_write_flags	flags;
 	enum bch_data_type	data_type;
@@ -71,6 +73,7 @@ struct alloc_request {
 
 	unsigned		scratch_nr_replicas;
 	unsigned		scratch_nr_effective;
+	enum bch_write_flags	scratch_flags;
 	bool			scratch_have_cache;
 	enum bch_data_type	scratch_data_type;
 	struct open_buckets	scratch_ptrs;
@@ -81,8 +84,10 @@ struct alloc_request {
 		u8		nr;
 		struct alloc_trace_entry {
 			u8	dev;
+			bool	new_stripe_alloc:1;
 			bool	will_retry_all_devices:1;
 			bool	will_retry_target_devices:1;
+			bool	will_retry_set_devices:1;
 			bool	have_cl:1;
 			s16	err;
 		}		entries[16];
@@ -97,8 +102,10 @@ static inline int alloc_trace_add(struct alloc_request *req,
 		struct alloc_trace_entry *e = &req->trace.entries[idx];
 
 		e->dev				= dev;
+		e->new_stripe_alloc		= req->new_stripe_alloc;
 		e->will_retry_all_devices	= req->will_retry_all_devices;
 		e->will_retry_target_devices	= req->will_retry_target_devices;
+		e->will_retry_set_devices	= req->will_retry_set_devices;
 		e->have_cl			= req->cl != NULL;
 		e->err				= err;
 		req->trace.nr++;
@@ -201,7 +208,7 @@ static inline void bch2_alloc_sectors_done_inlined(struct bch_fs *c, struct writ
 
 	unsigned sectors = wp->prev_sectors_free - wp->sectors_free;
 	event_add_trace(c, sectors_alloc, sectors, buf, ({
-		prt_str(&buf, __bch2_data_types[wp->data_type]);
+		prt_str(&buf, bch2_data_type_str(wp->data_type));
 	}));
 
 	mutex_unlock(&wp->lock);

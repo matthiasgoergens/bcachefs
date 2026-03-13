@@ -30,6 +30,11 @@
 #include <linux/random.h>
 #include <linux/prefetch.h>
 
+unsigned bch2_srcu_escalation_timeout_ms = 0;
+module_param_named(srcu_escalation_timeout_ms, bch2_srcu_escalation_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(srcu_escalation_timeout_ms,
+	"0=always drop SRCU before blocking (original), N>0=two-phase with (N-1)ms timeout");
+
 static inline void btree_path_list_remove(struct btree_trans *, struct btree_path *);
 static inline void btree_path_list_add(struct btree_trans *,
 			btree_path_idx_t, btree_path_idx_t);
@@ -1738,7 +1743,7 @@ static noinline void btree_paths_realloc(struct btree_trans *trans)
 			  sizeof(struct btree_trans_paths) +
 			  nr * sizeof(struct btree_path) +
 			  nr * sizeof(btree_path_idx_t) + 8 +
-			  nr * sizeof(struct btree_insert_entry), GFP_KERNEL|__GFP_NOFAIL);
+			  nr * sizeof(struct btree_insert_entry), GFP_NOFS|__GFP_NOFAIL);
 
 	unsigned long *paths_allocated = p;
 	memcpy(paths_allocated, trans->paths_allocated, BITS_TO_LONGS(trans->nr_paths) * sizeof(unsigned long));
@@ -3510,6 +3515,9 @@ u32 bch2_trans_begin(struct btree_trans *trans)
 
 	now = local_clock();
 
+	if (!trans->last_yield_time)
+		trans->last_yield_time = now;
+
 	if (!IS_ENABLED(CONFIG_BCACHEFS_NO_LATENCY_ACCT) &&
 	    time_after64(now, trans->last_begin_time + 10))
 		__bch2_time_stats_update(&btree_trans_stats(trans)->duration,
@@ -3517,10 +3525,11 @@ u32 bch2_trans_begin(struct btree_trans *trans)
 
 	if (!trans->restarted &&
 	    (need_resched() ||
-	     time_after64(now, trans->last_begin_time + BTREE_TRANS_MAX_LOCK_HOLD_TIME_NS))) {
+	     time_after64(now, trans->last_yield_time + BTREE_TRANS_MAX_LOCK_HOLD_TIME_NS))) {
 		bch2_trans_unlock(trans);
 		cond_resched();
 		now = local_clock();
+		trans->last_yield_time = now;
 	}
 	trans->last_begin_time = now;
 
@@ -3649,7 +3658,7 @@ struct btree_trans *__bch2_trans_get(struct bch_fs *c, unsigned fn_idx)
 		if (s->max_mem) {
 			unsigned expected_mem_bytes = roundup_pow_of_two(s->max_mem);
 
-			trans->mem = kmalloc(expected_mem_bytes, GFP_KERNEL|__GFP_NOWARN);
+			trans->mem = kmalloc(expected_mem_bytes, GFP_NOFS|__GFP_NOWARN);
 			if (likely(trans->mem))
 				trans->mem_bytes = expected_mem_bytes;
 		}
@@ -3933,8 +3942,8 @@ int bch2_fs_btree_iter_init(struct bch_fs *c)
 	if (!c->btree.trans.bufs)
 		return -ENOMEM;
 
-	try(mempool_init_kmalloc_pool(&c->btree.trans.pool, 1, sizeof(struct btree_trans)));
-	try(mempool_init_kmalloc_pool(&c->btree.trans.malloc_pool, 1, BTREE_TRANS_MEM_MAX));
+	try(mempool_init_kmalloc_pool(&c->btree.trans.pool, 8, sizeof(struct btree_trans)));
+	try(mempool_init_kmalloc_pool(&c->btree.trans.malloc_pool, 8, BTREE_TRANS_MEM_MAX));
 	try(init_srcu_struct(&c->btree.trans.barrier));
 
 	/*

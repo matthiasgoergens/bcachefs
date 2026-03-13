@@ -322,7 +322,7 @@ static int bch2_journal_replay_key(struct btree_trans *trans,
 						     BIT_ULL(BCH_RECOVERY_PASS_check_topology)))) {
 			bch_err(c, "have key in journal replay for btree depth that does not exist, confused\n%s",
 				buf.buf);
-			return -EINVAL;
+			return bch_err_throw(c, EINVAL_journal_replay_key_bad_btree_depth);
 		}
 
 		if (!k->allocated) {
@@ -736,6 +736,11 @@ use_clean:
 
 	if (c->sb.features & BIT_ULL(BCH_FEATURE_small_image)) {
 		bch_info(c, "filesystem is an unresized image file, mounting ro");
+		c->opts.read_only = true;
+	}
+
+	if (c->sb.features & BIT_ULL(BCH_FEATURE_no_default_sb)) {
+		bch_info(c, "filesystem does not have default superblock layout, mounting ro");
 		c->opts.read_only = true;
 	}
 

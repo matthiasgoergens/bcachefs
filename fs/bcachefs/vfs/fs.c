@@ -4,6 +4,7 @@
 #include "bcachefs.h"
 
 #include "alloc/accounting.h"
+#include "alloc/background.h"
 #include "alloc/buckets.h"
 
 #include "btree/update.h"
@@ -31,6 +32,7 @@
 #include "vfs/buffered.h"
 #include "vfs/direct.h"
 #include "vfs/pagecache.h"
+#include "vfs/swap.h"
 
 #include <linux/aio.h>
 #include <linux/backing-dev.h>
@@ -354,7 +356,7 @@ repeat:
 			if (!trans) {
 				__wait_on_freeing_inode(c, inode, inum);
 			} else {
-				int ret = drop_locks_do(trans,
+				int ret = drop_locks_long_do(trans,
 						(__wait_on_freeing_inode(c, inode, inum), 0));
 				if (ret)
 					return ERR_PTR(ret);
@@ -932,7 +934,7 @@ static int bch2_rename2(struct mnt_idmap *idmap,
 	int ret;
 
 	if (flags & ~(RENAME_NOREPLACE|RENAME_EXCHANGE|RENAME_WHITEOUT))
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_rename_bad_flags);
 
 	if (mode == BCH_RENAME_OVERWRITE)
 		try(filemap_write_and_wait_range(src_inode->v.i_mapping, 0, LLONG_MAX));
@@ -1362,7 +1364,7 @@ static int fssetxattr_inode_update_fn(struct btree_trans *trans,
 	if (!S_ISREG(bi->bi_mode) &&
 	    !S_ISDIR(bi->bi_mode) &&
 	    (s->flags & (BCH_INODE_nodump|BCH_INODE_noatime)) != s->flags)
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_setattr_bad_file_type);
 
 	if (s->set_casefold &&
 	    s->casefold != bch2_inode_casefold(c, bi))
@@ -1540,6 +1542,9 @@ static const struct address_space_operations bch_address_space_operations = {
 	.migrate_folio	= filemap_migrate_folio,
 #endif
 	.error_remove_folio = generic_error_remove_folio,
+	.swap_activate	= bch2_swap_activate,
+	.swap_deactivate = bch2_swap_deactivate,
+	.swap_rw	= bch2_swap_rw,
 };
 
 struct bcachefs_fid {
@@ -1677,7 +1682,7 @@ static int bch2_get_name(struct dentry *parent, char *name, struct dentry *child
 	int ret;
 
 	if (!S_ISDIR(dir->v.i_mode))
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_get_name_not_dir);
 
 	CLASS(btree_trans, trans)(c);
 	CLASS(btree_iter, iter1)(trans, BTREE_ID_dirents,
@@ -2287,7 +2292,7 @@ got_sb:
 	if (ret)
 		goto err_put_super;
 
-	sb->s_bdi->ra_pages		= VM_READAHEAD_PAGES;
+	sb->s_bdi->ra_pages = bch2_fs_ra_pages(c);
 
 	scoped_guard(rcu) {
 		for_each_online_member_rcu(c, ca) {
@@ -2390,11 +2395,13 @@ static int bch2_fs_parse_param(struct fs_context *fc,
 	if (fc->root)
 		c = fc->root->d_sb->s_fs_info;
 
+	CLASS(printbuf, err)();
 	int ret = bch2_parse_one_mount_opt(c, &opts->opts,
 					   &opts->parse_later, param->key,
-					   param->string);
+					   param->string,
+					   &err);
 	if (ret)
-		pr_err("Error parsing option %s: %s", param->key, bch2_err_str(ret));
+		pr_err("Error parsing option %s", err.buf);
 
 	return bch2_err_class(ret);
 }
@@ -2423,7 +2430,7 @@ static int bch2_fs_reconfigure(struct fs_context *fc)
 			ret = bch2_fs_read_write(c);
 			if (ret) {
 				bch_err(c, "error going rw: %i", ret);
-				return -EINVAL;
+				return bch_err_throw(c, EINVAL_reconfigure_read_write);
 			}
 
 			sb->s_flags &= ~SB_RDONLY;

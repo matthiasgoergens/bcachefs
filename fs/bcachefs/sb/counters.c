@@ -20,7 +20,7 @@ const char * const bch2_counter_names[] = {
 };
 
 const enum bch_counters_flags bch2_counter_flags_map[] = {
-#define x(t, n, flags) [BCH_COUNTER_##t] = flags,
+#define x(t, n, flags, ...) [BCH_COUNTER_##t] = flags,
 	BCH_PERSISTENT_COUNTERS()
 #undef x
 };
@@ -184,7 +184,7 @@ long bch2_ioctl_query_counters(struct bch_fs *c,
 
 	if ((arg.flags & ~BCH_IOCTL_QUERY_COUNTERS_MOUNT) ||
 	    arg.pad)
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_ioctl_query_counters_bad_flags);
 
 	arg.nr = min(arg.nr, BCH_COUNTER_NR);
 	try(put_user(arg.nr, &user_arg->nr));

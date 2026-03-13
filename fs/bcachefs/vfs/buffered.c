@@ -116,6 +116,8 @@ static int readpage_bio_extend(struct btree_trans *trans,
 {
 	/* Don't hold btree locks while allocating memory: */
 	bch2_trans_unlock(trans);
+	unsigned long _start = jiffies;
+	bch2_trans_srcu_unlock_if_elapsed(trans, _start);
 
 	while (bio_sectors(bio) < sectors_this_extent &&
 	       bio->bi_vcnt < bio->bi_max_vecs) {

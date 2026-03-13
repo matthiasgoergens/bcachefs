@@ -14,7 +14,6 @@
 #include "bcachefs.h"
 
 #include "alloc/backpointers.h"
-#include "alloc/buckets_waiting_for_journal.h"
 #include "alloc/buckets.h"
 #include "alloc/check.h"
 #include "alloc/discard.h"
@@ -48,7 +47,7 @@ static void bch2_trans_mutex_lock_norelock(struct btree_trans *trans,
 					   struct mutex *lock)
 {
 	if (!mutex_trylock(lock)) {
-		bch2_trans_unlock(trans);
+		bch2_trans_unlock_long(trans);
 		mutex_lock(lock);
 	}
 }
@@ -193,21 +192,24 @@ static inline bool may_alloc_bucket(struct bch_fs *c,
 		return false;
 	}
 
-	u64 journal_seq_ready =
-		bch2_bucket_journal_seq_ready(&c->buckets_waiting_for_journal,
-					      bucket.inode, bucket.offset);
-	if (journal_seq_ready > c->journal.flushed_seq_ondisk) {
-		if (journal_seq_ready > c->journal.flushing_seq)
-			req->counters.need_journal_commit++;
-		req->counters.skipped_need_journal_commit++;
-		return false;
-	}
-
 	if (bch2_bucket_nocow_is_locked(&c->nocow_locks, bucket)) {
 		req->counters.skipped_nocow++;
 		return false;
 	}
 
+	return true;
+}
+
+static inline bool may_alloc_bucket_journal_seq(struct bch_fs *c,
+						struct alloc_request *req,
+						u64 journal_seq_empty)
+{
+	if (journal_seq_empty > c->journal.flushed_seq_ondisk) {
+		if (journal_seq_empty > c->journal.flushing_seq)
+			req->counters.need_journal_commit++;
+		req->counters.skipped_need_journal_commit++;
+		return false;
+	}
 	return true;
 }
 
@@ -276,10 +278,14 @@ static struct open_bucket *try_alloc_bucket(struct btree_trans *trans,
 		return NULL;
 
 	u8 gen;
-	int ret = bch2_check_discard_freespace_key_async(trans, freespace_iter, &gen);
+	u64 journal_seq_empty;
+	int ret = bch2_check_discard_freespace_key_async(trans, freespace_iter, &gen, &journal_seq_empty);
 	if (ret < 0)
 		return ERR_PTR(ret);
 	if (ret)
+		return NULL;
+
+	if (!may_alloc_bucket_journal_seq(c, req, journal_seq_empty))
 		return NULL;
 
 	return __try_alloc_bucket(c, req, b, gen);
@@ -351,7 +357,8 @@ again:
 		if (a->data_type == BCH_DATA_free) {
 			req->counters.buckets_seen++;
 
-			ob = may_alloc_bucket(c, req, k.k->p)
+			ob = may_alloc_bucket(c, req, k.k->p) &&
+			     may_alloc_bucket_journal_seq(c, req, a->journal_seq_empty)
 				? __try_alloc_bucket(c, req, k.k->p.offset, a->gen)
 				: NULL;
 			if (ob)
@@ -457,9 +464,10 @@ static noinline void bucket_alloc_to_text(struct printbuf *out,
 	}
 
 	prt_printf(out, "watermark\t%s\n",	bch2_watermarks[req->watermark]);
-	prt_printf(out, "data type\t%s\n",	__bch2_data_types[req->data_type]);
+	prt_printf(out, "data type\t%s\n",	bch2_data_type_str(req->data_type));
 	prt_printf(out, "will_retry_target_devices\t%u\n",	req->will_retry_target_devices);
 	prt_printf(out, "will_retry_all_devices\t%u\n",	req->will_retry_all_devices);
+	prt_printf(out, "will_retry_set_devices\t%u\n",	req->will_retry_set_devices);
 	prt_printf(out, "blocking\t%u\n", !(req->flags & BCH_WRITE_alloc_nowait));
 	prt_printf(out, "free\t%llu\n",	req->usage.buckets[BCH_DATA_free]);
 	prt_printf(out, "copygc_wait\t%llu/%lli\n",
@@ -520,7 +528,8 @@ again:
 		if (req->cl &&
 		    !(req->flags & BCH_WRITE_alloc_nowait) &&
 		    !req->will_retry_target_devices &&
-		    !req->will_retry_all_devices) {
+		    !req->will_retry_all_devices &&
+		    !req->will_retry_set_devices) {
 			if (!waiting) {
 				closure_wait(&c->allocator.freelist_wait, req->cl);
 				waiting = true;
@@ -572,7 +581,8 @@ err:
 			bch2_fs_open_buckets_to_text(&buf, c));
 	} else if (!bch2_err_matches(ret, BCH_ERR_transaction_restart) &&
 		   !req->will_retry_target_devices &&
-		   !req->will_retry_all_devices)
+		   !req->will_retry_all_devices &&
+		   !req->will_retry_set_devices)
 		event_inc_trace(c, bucket_alloc_fail, buf,
 			bucket_alloc_to_text(&buf, c, req, ob));
 
@@ -733,6 +743,9 @@ int bch2_bucket_alloc_set_trans(struct btree_trans *trans,
 			req->ca = NULL;
 			continue;
 		}
+
+		req->will_retry_set_devices =
+			i + 1 < req->devs_sorted.data + req->devs_sorted.nr;
 
 		struct open_bucket *ob = bch2_bucket_alloc_trans(trans, req);
 		if (!IS_ERR(ob))
@@ -1209,8 +1222,11 @@ retry:
 			/*
 			 * Only try to allocate cache (durability = 0 devices) from the
 			 * specified target:
+			 *
+			 * Only allocate stripes on the specified target
 			 */
 			req->have_cache			= true;
+			req->ec				= false;
 			req->target			= 0;
 			req->will_retry_all_devices	= false;
 			continue;
@@ -1500,7 +1516,7 @@ void bch2_fs_open_buckets_to_text(struct printbuf *out, struct bch_fs *c)
 
 	for (unsigned i = 0; i < ARRAY_SIZE(nr); i++)
 		if (nr[i])
-			prt_printf(out, "open_buckets %s:\t%u\n", __bch2_data_types[i], nr[i]);
+			prt_printf(out, "open_buckets %s:\t%u\n", bch2_data_type_str(i), nr[i]);
 
 	prt_printf(out, "open_buckets_wait\t%s\n",		a->open_buckets_wait.list.first ? "waiting" : "empty");
 }
@@ -1609,10 +1625,14 @@ static void alloc_trace_to_text(struct printbuf *out, struct bch_fs *c,
 				prt_printf(out, "dev %u", e->dev);
 			else
 				prt_str(out, "no dev");
+			if (e->new_stripe_alloc)
+				prt_str(out, " new_stripe");
 			if (e->will_retry_all_devices)
 				prt_str(out, " retry_all");
 			if (e->will_retry_target_devices)
 				prt_str(out, " retry_target");
+			if (e->will_retry_set_devices)
+				prt_str(out, " retry_set");
 			if (e->have_cl)
 				prt_str(out, " cl");
 			prt_printf(out, " -> %s\n",
@@ -1638,7 +1658,7 @@ static noinline void bch2_print_allocator_stuck(struct bch_fs *c, struct alloc_r
 		prt_newline(&buf);
 
 		prt_printf(&buf, "watermark:\t%s\n", bch2_watermarks[req->watermark]);
-		prt_printf(&buf, "data_type:\t%s\n", __bch2_data_types[req->data_type]);
+		prt_printf(&buf, "data_type:\t%s\n", bch2_data_type_str(req->data_type));
 
 		prt_str(&buf, "flags:\t");
 		prt_bitflags(&buf, bch2_write_flags, req->flags);
@@ -1647,6 +1667,7 @@ static noinline void bch2_print_allocator_stuck(struct bch_fs *c, struct alloc_r
 		prt_printf(&buf, "ec:\t%u\n", req->ec);
 		prt_printf(&buf, "will_retry_all_devices:\t%u\n", req->will_retry_all_devices);
 		prt_printf(&buf, "will_retry_target_devices:\t%u\n", req->will_retry_target_devices);
+		prt_printf(&buf, "will_retry_set_devices:\t%u\n", req->will_retry_set_devices);
 		prt_printf(&buf, "have_cl:\t%u\n", req->cl != NULL);
 
 		if (req->devs_have && req->devs_have->nr) {
@@ -1654,6 +1675,19 @@ static noinline void bch2_print_allocator_stuck(struct bch_fs *c, struct alloc_r
 			bch2_devs_list_to_text(&buf, c, req->devs_have);
 			prt_newline(&buf);
 		}
+
+		prt_printf(&buf, "devs_may_alloc:\t");
+		{
+			unsigned i;
+			for_each_set_bit(i, req->devs_may_alloc.d, BCH_SB_MEMBERS_MAX)
+				prt_printf(&buf, "%u ", i);
+		}
+		prt_newline(&buf);
+
+		prt_printf(&buf, "devs_sorted:\t");
+		darray_for_each(req->devs_sorted, i)
+			prt_printf(&buf, "%u ", *i);
+		prt_newline(&buf);
 
 		alloc_trace_to_text(&buf, c, &req->trace);
 		prt_newline(&buf);
