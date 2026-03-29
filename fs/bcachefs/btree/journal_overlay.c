@@ -734,6 +734,28 @@ void bch2_journal_keys_put(struct bch_fs *c)
 	genradix_free(&c->journal_entries);
 }
 
+/*
+ * Free the sorted journal keys array without freeing journal_entries,
+ * so that bch2_journal_keys_sort() can re-sort from the raw entries
+ * (e.g. after changing journal_rewind).
+ */
+static void bch2_journal_keys_reset(struct bch_fs *c)
+{
+	struct journal_keys *keys = &c->journal_keys;
+
+	move_gap(keys, keys->nr);
+
+	darray_for_each(*keys, i)
+		if (i->allocated)
+			kfree(i->allocated_k);
+
+	kvfree(keys->data);
+	keys->data = NULL;
+	keys->nr = keys->gap = keys->size = 0;
+
+	darray_exit(&keys->overwrites);
+}
+
 static void __journal_keys_sort(struct journal_keys *keys)
 {
 	struct bch_fs *c = container_of(keys, struct bch_fs, journal_keys);
@@ -763,6 +785,15 @@ static void __journal_keys_sort(struct journal_keys *keys)
 	keys->nr = dst - keys->data;
 }
 
+static bool journal_seq_is_rewound(struct bch_fs *c, u64 seq)
+{
+	darray_for_each(c->journal.rewind_ranges, range)
+		if (seq > range->to && seq <= range->from)
+			return true;
+
+	return false;
+}
+
 int bch2_journal_keys_sort(struct bch_fs *c)
 {
 	struct genradix_iter iter;
@@ -771,7 +802,9 @@ int bch2_journal_keys_sort(struct bch_fs *c)
 	size_t nr_read = 0;
 	size_t nr_extra_sorts = 0;
 
-	u64 rewind_seq = c->opts.journal_rewind ?: U64_MAX;
+	/* We may be called more than once - when deciding to rewind because of
+	 * opts.scrub_recent_journal_entries */
+	bch2_journal_keys_reset(c);
 
 	genradix_for_each(&c->journal_entries, iter, _i) {
 		i = *_i;
@@ -781,10 +814,18 @@ int bch2_journal_keys_sort(struct bch_fs *c)
 
 		cond_resched();
 
+		bool seq_rewound = journal_seq_is_rewound(c, le64_to_cpu(i->j.seq));
+
+		if (seq_rewound && !JSET_HAS_OVERWRITES(&i->j)) {
+			bch_err(c, "cannot rewind journal seq %llu: no overwrite entries (journal_transaction_names was off)",
+				le64_to_cpu(i->j.seq));
+			return bch_err_throw(c, journal_rewind_no_overwrites);
+		}
+
 		vstruct_for_each(&i->j, entry) {
-			bool rewind = !entry->level &&
-				!btree_id_is_alloc(entry->btree_id) &&
-				le64_to_cpu(i->j.seq) >= rewind_seq;
+			bool rewind = seq_rewound &&
+				!entry->level &&
+				!btree_id_is_alloc(entry->btree_id);
 
 			if (entry->type != (rewind
 					    ? BCH_JSET_ENTRY_overwrite
@@ -823,6 +864,12 @@ int bch2_journal_keys_sort(struct bch_fs *c)
 
 	__journal_keys_sort(keys);
 	keys->gap = keys->nr;
+
+	darray_for_each(*keys, i) {
+		struct bkey_i *k = journal_key_k(c, i);
+		if (k->k.type == KEY_TYPE_btree_ptr_v2)
+			bkey_i_to_btree_ptr_v2(k)->v.mem_ptr = 0;
+	}
 
 	CLASS(bch_log_msg_level, msg)(c, nr_extra_sorts ? LOGLEVEL_debug : LOGLEVEL_notice);
 	prt_printf(&msg.m, "Journal keys: %zu read, %zu after sorting and compacting", nr_read, keys->nr);

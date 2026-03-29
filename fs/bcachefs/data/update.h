@@ -16,7 +16,8 @@ struct moving_context;
 	x(reconcile)		\
 	x(promote)		\
 	x(self_heal)		\
-	x(scrub)
+	x(scrub)		\
+	x(scrub_no_repair)
 
 enum bch_data_update_types {
 #define x(n)	BCH_DATA_UPDATE_##n,
@@ -100,6 +101,8 @@ int bch2_data_update_init(struct btree_trans *, struct btree_iter *,
 			  struct write_point_specifier,
 			  struct bch_inode_opts *, struct data_update_opts,
 			  enum btree_id, struct bkey_s_c);
+
+unsigned ptr_mask_remap(struct bch_fs *, struct bkey_s_c, unsigned, struct bkey_s_c);
 
 void bch2_fs_data_update_exit(struct bch_fs *);
 int bch2_fs_data_update_init(struct bch_fs *);

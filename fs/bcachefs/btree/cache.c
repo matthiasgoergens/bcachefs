@@ -1,5 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0
 
+/* DOC(btree-node-cache)
+ *
+ * In-memory btree nodes are kept in a hash table indexed by their physical
+ * on-disk pointer (not their logical position). This is because btree node
+ * split and compact operations are copy-on-write: new nodes are allocated, the
+ * parent is updated to point to them, and the old nodes are freed. Indexing by
+ * physical pointer avoids the need to atomically update the hash table during
+ * these operations.
+ *
+ * The `struct btree` objects themselves are never freed during normal operation
+ * (only at shutdown), which means locks can be dropped and retaken without
+ * reference counting. This enables the aggressive lock-dropping discipline
+ * that keeps btree lock hold times bounded to in-memory operations: after
+ * dropping a lock, a sequence number check determines whether the node has
+ * changed and needs to be re-traversed.
+ *
+ * Btree roots are pinned in memory and accessed directly. All other nodes may
+ * be evicted from the cache and reused for different on-disk nodes at any time
+ * when unlocked, so after locking a node the caller must verify it is still
+ * the expected node.
+ */
+
 #include "bcachefs.h"
 
 #include "btree/bbpos.h"
@@ -839,7 +861,7 @@ struct btree *bch2_btree_node_mem_alloc(struct btree_trans *trans, bool pcpu_rea
 		bch2_btree_lock_init(&b->c, pcpu_read_locks ? SIX_LOCK_INIT_PCPU : 0, GFP_NOWAIT);
 	} else {
 		mutex_unlock(&bc->lock);
-		bch2_trans_unlock(trans);
+		bch2_trans_unlock_long(trans);
 		b = __btree_node_mem_alloc(c, GFP_KERNEL);
 		if (!b)
 			goto err;
@@ -873,7 +895,7 @@ got_node:
 	mutex_unlock(&bc->lock);
 
 	if (btree_node_data_alloc(c, b, GFP_NOWAIT, true)) {
-		bch2_trans_unlock(trans);
+		bch2_trans_unlock_long(trans);
 		if (btree_node_data_alloc(c, b, GFP_KERNEL|__GFP_NOWARN, true)) {
 			__btree_node_data_free(b);
 			goto err;
@@ -1008,7 +1030,7 @@ static noinline struct btree *bch2_btree_node_fill(struct btree_trans *trans,
 
 			/* Unlock before doing IO: */
 			six_unlock_intent(&b->c.lock);
-			bch2_trans_unlock(trans);
+			bch2_trans_unlock_long(trans);
 
 			bch2_btree_node_read(trans, b, sync);
 
@@ -1146,7 +1168,7 @@ retry:
 		u32 seq = six_lock_seq(&b->c.lock);
 
 		six_unlock_type(&b->c.lock, lock_type);
-		bch2_trans_unlock(trans);
+		bch2_trans_unlock_long(trans);
 
 		bch2_btree_node_wait_on_read(b);
 
