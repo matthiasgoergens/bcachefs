@@ -169,6 +169,7 @@ int bch2_sb_disk_groups_to_cpu(struct bch_fs *c)
 	return 0;
 }
 
+/* Caller holds rcu: */
 const struct bch_devs_mask *bch2_target_to_mask(struct bch_fs *c, unsigned target)
 {
 	struct target t = target_decode(target);

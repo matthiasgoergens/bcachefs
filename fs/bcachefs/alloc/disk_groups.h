@@ -63,10 +63,13 @@ static inline struct bch_devs_mask target_rw_devs(struct bch_fs *c,
 						  u16 target)
 {
 	struct bch_devs_mask devs = c->allocator.rw_devs[data_type];
-	const struct bch_devs_mask *t = bch2_target_to_mask(c, target);
+	const struct bch_devs_mask *t;
 
-	if (t)
-		bitmap_and(devs.d, devs.d, t->d, BCH_SB_MEMBERS_MAX);
+	scoped_guard(rcu) {
+		t = bch2_target_to_mask(c, target);
+		if (t)
+			bitmap_and(devs.d, devs.d, t->d, BCH_SB_MEMBERS_MAX);
+	}
 	return devs;
 }
 
