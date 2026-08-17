@@ -132,6 +132,7 @@ endif
 
 ifndef BCACHEFS_DKMS
 	obj-$(CONFIG_MEAN_AND_VARIANCE_UNIT_TEST)   += util/mean_and_variance_test.o
+	obj-$(CONFIG_STRIPE_UNIT_TEST)              += data/ec/stripe_test.o
 endif
 
 ifdef BCACHEFS_DKMS
